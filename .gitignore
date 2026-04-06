@@ -1,0 +1,14 @@
+# Downloaded font files — large binaries, regenerated at runtime
+fonts/
+font_instances/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# OS
+.DS_Store
+Thumbs.db
