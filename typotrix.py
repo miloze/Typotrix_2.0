@@ -11,6 +11,7 @@ Touch:  tap left  → next font
 
 import pygame
 import requests
+import re
 import os
 import random
 import json
@@ -22,13 +23,13 @@ os.environ['DISPLAY'] = ':0'
 
 # ── Variable font support ─────────────────────────────────────────────────────
 try:
-    from fonttools.ttLib import TTFont
-    from fonttools.varLib.instancer import instantiateVariableFont
+    from fontTools.ttLib import TTFont
+    from fontTools.varLib.instancer import instantiateVariableFont
     HAS_FONTTOOLS = True
 except ImportError:
     try:
-        from fonttools.ttLib import TTFont
-        from fonttools.varLib.mutator import instantiateVariableFont
+        from fontTools.ttLib import TTFont
+        from fontTools.varLib.mutator import instantiateVariableFont
         HAS_FONTTOOLS = True
     except ImportError:
         HAS_FONTTOOLS = False
@@ -38,7 +39,7 @@ API_KEY      = "AIzaSyCltIMLz8FERwlYfYPOPlj0tzM4GneDbhg"
 SCREEN_SIZE  = (720, 720)
 FONT_CACHE   = os.path.expanduser("~/fonts")
 INST_CACHE   = os.path.expanduser("~/font_instances")
-WEIGHT_STEPS = 7      # pre-rendered frames thin → bold
+WEIGHT_STEPS = 5      # pre-rendered frames thin → bold
 ANIM_PERIOD  = 6.0    # seconds for one full thin → bold → thin cycle
 
 os.makedirs(FONT_CACHE, exist_ok=True)
@@ -49,6 +50,35 @@ WEIGHT_PRIORITY = [
     "600italic", "600", "500italic", "500", "italic", "regular",
     "400italic", "400", "300italic", "300", "200italic", "200",
     "100italic", "100",
+]
+
+# Browser UA required to receive WOFF2 variable fonts from Google Fonts CSS2 API
+CHROME_UA = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+)
+
+# Curated variable fonts: (display name, google/fonts repo dir, license subdir)
+# GitHub repo has full TTFs with variation data intact
+VARIABLE_FAMILIES = [
+    ("Roboto Flex",       "robotoflex",        "ofl"),
+    ("Recursive",         "recursive",         "ofl"),
+    ("Fraunces",          "fraunces",          "ofl"),
+    ("Raleway",           "raleway",           "ofl"),
+    ("Figtree",           "figtree",           "ofl"),
+    ("Crimson Pro",       "crimsonpro",        "ofl"),
+    ("Syne",              "syne",              "ofl"),
+    ("Anybody",           "anybody",           "ofl"),
+    ("Encode Sans",       "encodesans",        "ofl"),
+    ("Manrope",           "manrope",           "ofl"),
+    ("Nunito",            "nunito",            "ofl"),
+    ("Jost",              "jost",              "ofl"),
+    ("Outfit",            "outfit",            "ofl"),
+    ("Urbanist",          "urbanist",          "ofl"),
+    ("Cabin",             "cabin",             "apache"),
+    ("Inter",             "inter",             "ofl"),
+    ("DM Sans",           "dmsans",            "ofl"),
+    ("Plus Jakarta Sans", "plusjakartasans",   "ofl"),
 ]
 
 EXCLUDE_FONTS = {
@@ -93,12 +123,59 @@ def ease_in_out(t):
     return t * t * (3 - 2 * t)
 
 # ── Google Fonts API ──────────────────────────────────────────────────────────
-def get_wght_axis(font_item):
-    """Return (wght_min, wght_max) if the font declares a wght axis, else None."""
-    for ax in font_item.get("axes", []):
-        if ax["tag"] == "wght":
-            return int(ax["start"]), int(ax["end"])
+def get_github_vf_url(dir_name, license_dir="ofl"):
+    """
+    Fetch the download URL for a variable font TTF from the google/fonts GitHub repo.
+    Variable font filenames contain '[' (axis tags), e.g. Roboto[wght].ttf.
+    """
+    api_url = f"https://api.github.com/repos/google/fonts/contents/{license_dir}/{dir_name}"
+    try:
+        r = requests.get(api_url, timeout=8)
+        if r.status_code != 200:
+            return None
+        files = r.json()
+        # Prefer TTFs with axis tags in the filename (variable fonts)
+        for f in files:
+            if f["name"].endswith(".ttf") and "[" in f["name"]:
+                return f["download_url"]
+        # Fallback: any TTF
+        for f in files:
+            if f["name"].endswith(".ttf"):
+                return f["download_url"]
+    except Exception as e:
+        print(f"GitHub API error ({dir_name}): {e}")
     return None
+
+def fetch_variable_font_items():
+    """Resolve variable font download URLs via the Google Fonts GitHub repo."""
+    items = []
+    for family, dir_name, license_dir in VARIABLE_FAMILIES:
+        safe = os.path.join(FONT_CACHE, f"{family.replace(' ', '_')}_variable.ttf")
+        if os.path.exists(safe):
+            # Already downloaded — infer wght range from fvar
+            wght = get_wght_from_file(safe)
+            if wght:
+                items.append({
+                    "family": family, "_use": "variable",
+                    "_is_variable": True,
+                    "_wght_min": wght[0], "_wght_max": wght[1],
+                    "_vf_url": None, "_vf_path": safe,
+                })
+                print(f"  VF cached: {family} wght {wght[0]}–{wght[1]}")
+            continue
+
+        url = get_github_vf_url(dir_name, license_dir)
+        if url:
+            items.append({
+                "family": family, "_use": "variable",
+                "_is_variable": True,
+                "_wght_min": 100, "_wght_max": 900,  # will be refined after download
+                "_vf_url": url,
+            })
+            print(f"  VF: {family} → {url.split('/')[-1]}")
+        else:
+            print(f"  VF not found: {family}")
+    return items
 
 def get_fonts():
     url = (
@@ -107,29 +184,21 @@ def get_fonts():
     )
     r = requests.get(url)
     data = r.json()
-
-    variable, static = [], []
+    static = []
     for f in data["items"]:
         if f["family"].lower() in EXCLUDE_FONTS:
             continue
-        wght = get_wght_axis(f)
-        if wght and HAS_FONTTOOLS:
-            # Variable font — prefer the single variable-font file
-            vf_key = "regular" if "regular" in f["files"] else next(iter(f["files"]), None)
-            if vf_key:
-                f["_is_variable"] = True
-                f["_wght_min"], f["_wght_max"] = wght
-                f["_use"] = vf_key
-                variable.append(f)
-        else:
-            for w in WEIGHT_PRIORITY:
-                if w in f["files"]:
-                    f["_use"] = w
-                    f["_is_variable"] = False
-                    static.append(f)
-                    break
+        for w in WEIGHT_PRIORITY:
+            if w in f["files"]:
+                f["_use"] = w
+                f["_is_variable"] = False
+                static.append(f)
+                break
 
-    # Interleave ~1 variable per 3 static so the playlist stays varied
+    variable = fetch_variable_font_items()
+    print(f"{len(variable)} variable fonts, {len(static)} static fonts")
+
+    # Interleave: 1 variable font per 3 static
     result = []
     vi = si = 0
     while vi < len(variable) or si < len(static):
@@ -140,11 +209,49 @@ def get_fonts():
                 result.append(static[si]); si += 1
     return result
 
+def get_wght_from_file(path):
+    """Check a font file for an fvar wght axis. Returns (min, max) or None."""
+    if not HAS_FONTTOOLS:
+        return None
+    try:
+        tt = TTFont(path)
+        if "fvar" not in tt:
+            return None
+        for axis in tt["fvar"].axes:
+            if axis.axisTag == "wght":
+                return int(axis.minValue), int(axis.maxValue)
+    except Exception:
+        pass
+    return None
+
 # ── Font download ─────────────────────────────────────────────────────────────
 def download_font(font_item):
+    family = font_item["family"]
+    safe   = family.replace(" ", "_")
+
+    # Variable font — use cached path or download from GitHub
+    if font_item.get("_is_variable"):
+        if "_vf_path" in font_item:
+            return font_item["_vf_path"]
+        path = os.path.join(FONT_CACHE, f"{safe}_variable.ttf")
+        if not os.path.exists(path) and font_item.get("_vf_url"):
+            try:
+                r = requests.get(font_item["_vf_url"], timeout=20)
+                r.raise_for_status()
+                with open(path, "wb") as fh:
+                    fh.write(r.content)
+                # Refine wght range now we have the actual file
+                wght = get_wght_from_file(path)
+                if wght:
+                    font_item["_wght_min"], font_item["_wght_max"] = wght
+            except Exception as e:
+                print(f"Variable download failed {family}: {e}")
+                return None
+        return path if os.path.exists(path) else None
+
+    # Static font — download TTF via v1 API files dict
     weight = font_item.get("_use", "regular")
-    name = font_item["family"].replace(" ", "_") + f"_{weight}"
-    path = os.path.join(FONT_CACHE, f"{name}.ttf")
+    path   = os.path.join(FONT_CACHE, f"{safe}_{weight}.ttf")
     if not os.path.exists(path):
         try:
             url = font_item["files"][weight]
@@ -153,7 +260,7 @@ def download_font(font_item):
             with open(path, "wb") as fh:
                 fh.write(r.content)
         except Exception as e:
-            print(f"Download failed: {e}")
+            print(f"Download failed {family}: {e}")
             if os.path.exists(path):
                 os.remove(path)
             return None
@@ -166,30 +273,47 @@ def download_font(font_item):
         return None
 
 # ── Variable font instancing ──────────────────────────────────────────────────
-def make_instance(vf_path, wght, family):
-    """Generate (and disk-cache) a static TTF pinned to a specific wght."""
-    safe = family.replace(" ", "_")
-    out = os.path.join(INST_CACHE, f"{safe}_{wght}.ttf")
-    if not os.path.exists(out):
-        try:
-            tt = TTFont(vf_path)
-            instantiateVariableFont(tt, {"wght": wght})
-            tt.save(out)
-        except Exception as e:
-            print(f"Instance failed wght={wght}: {e}")
-            return None
-    return out
-
 def build_weight_instances(vf_path, wght_min, wght_max, family):
-    """Return WEIGHT_STEPS instance paths spanning wght_min → wght_max."""
-    paths = []
-    for i in range(WEIGHT_STEPS):
-        t = i / (WEIGHT_STEPS - 1)
-        wght = round(wght_min + t * (wght_max - wght_min))
-        path = make_instance(vf_path, wght, family)
-        if path is None:
+    """
+    Return WEIGHT_STEPS static TTF paths spanning wght_min → wght_max.
+    Loads the source font once and pins ALL axes for fastest instancing.
+    Results are disk-cached so subsequent scene loads are instant.
+    """
+    import copy
+    safe   = family.replace(" ", "_")
+    wghts  = [
+        round(wght_min + i / (WEIGHT_STEPS - 1) * (wght_max - wght_min))
+        for i in range(WEIGHT_STEPS)
+    ]
+    paths  = [os.path.join(INST_CACHE, f"{safe}_{w}.ttf") for w in wghts]
+
+    # Return immediately if all already cached
+    if all(os.path.exists(p) for p in paths):
+        return paths
+
+    # Load source font once
+    try:
+        tt_base   = TTFont(vf_path)
+        # Collect default values for every axis so we fully instantiate
+        axis_defaults = {a.axisTag: a.defaultValue for a in tt_base["fvar"].axes}
+    except Exception as e:
+        print(f"Font load failed: {e}")
+        return None
+
+    for wght, out in zip(wghts, paths):
+        if os.path.exists(out):
+            continue
+        try:
+            tt = copy.deepcopy(tt_base)
+            axes = dict(axis_defaults)
+            axes["wght"] = wght          # vary only weight
+            instantiateVariableFont(tt, axes)
+            tt.save(out)
+            print(f"  instanced wght={wght}")
+        except Exception as e:
+            print(f"  instance failed wght={wght}: {e}")
             return None
-        paths.append(path)
+
     return paths
 
 # ── Font sizing ───────────────────────────────────────────────────────────────
@@ -378,8 +502,8 @@ def build_scene(fonts, fi, ui_font, inverted, screen, case_cache, circle=None):
     if path is None:
         return None, fi
 
-    is_variable = font_item.get("_is_variable", False)
     family      = font_item["family"]
+    is_variable = font_item.get("_is_variable", False)
     wght_min    = font_item.get("_wght_min", 400)
     wght_max    = font_item.get("_wght_max", 400)
 
@@ -396,12 +520,6 @@ def build_scene(fonts, fi, ui_font, inverted, screen, case_cache, circle=None):
         upper = random.random() < 0.5
         case_cache[fi] = [ch.upper() if upper else ch.lower() for ch in word[:4]]
     chars = list(case_cache[fi])
-
-    digit_key = f"digit_{fi}"
-    if digit_key not in case_cache:
-        case_cache[digit_key] = (random.randint(0, 3), str(random.randint(0, 9)))
-    digit_index, digit_char = case_cache[digit_key]
-    chars[digit_index] = digit_char
 
     char_grid = [chars[:2], chars[2:]]    # [[row0_ch0, row0_ch1], [row1_ch0, row1_ch1]]
 
@@ -509,10 +627,9 @@ def main():
 
     touches          = {}
     long_press_fired = set()
-    LONG_PRESS_MS       = 700
-    CENTER_ZONE         = 0.1
-    CIRCLE_MAX_R        = 600
-    CIRCLE_GROW_DURATION = 4.0
+    LONG_PRESS_MS = 350
+    CENTER_ZONE   = 0.1
+    CIRCLE_MAX_R  = int(math.sqrt(SCREEN_SIZE[0] ** 2 + SCREEN_SIZE[1] ** 2))  # screen diagonal
 
     running = True
     while running:
@@ -523,9 +640,9 @@ def main():
         growing_circle = None
 
         for fid, t in list(touches.items()):
-            held_ms  = now - t["start_time"]
-            cur_x    = 1.0 - t.get("cur_x", t["start_x"])
-            cur_y    = t.get("cur_y", t["start_y"])
+            held_ms   = now - t["start_time"]
+            cur_x     = 1.0 - t.get("cur_x", t["start_x"])   # invert x to match screen
+            cur_y     = t.get("cur_y", t["start_y"])
             is_center = (abs(cur_x - 0.5) < CENTER_ZONE
                          and abs(cur_y - 0.5) < CENTER_ZONE)
 
@@ -539,22 +656,18 @@ def main():
                             screen, case_cache, circle,
                         )
                     else:
-                        t["circle_colour"]   = get_colormind_color()
-                        t["circle_start_ms"] = now
+                        # Anchor circle at the press point (raw coords = screen coords)
+                        ax = int(t["start_x"] * SCREEN_SIZE[0])
+                        ay = int(t["start_y"] * SCREEN_SIZE[1])
+                        t["circle_colour"]  = get_colormind_color()
+                        t["circle_anchor"]  = (ax, ay)
 
-                if not is_center and "circle_colour" in t:
-                    grow_secs = (now - t["circle_start_ms"]) / 1000.0
-                    progress  = min(grow_secs / CIRCLE_GROW_DURATION, 1.0)
-                    eased     = ease_in_out(progress)
-                    r  = eased * CIRCLE_MAX_R
-                    px = int(cur_x * SCREEN_SIZE[0])
-                    py = int((1.0 - cur_y) * SCREEN_SIZE[1])
-                    if progress >= 1.0:
-                        t["circle_colour"]   = get_colormind_color()
-                        t["circle_start_ms"] = now
-                        if scene:
-                            scene.circle = None
-                    growing_circle = (px, py, r, t["circle_colour"])
+                if not is_center and "circle_anchor" in t:
+                    ax, ay = t["circle_anchor"]
+                    fx = int(t.get("cur_x", t["start_x"]) * SCREEN_SIZE[0])
+                    fy = int(t.get("cur_y", t["start_y"]) * SCREEN_SIZE[1])
+                    r  = min(math.sqrt((fx - ax) ** 2 + (fy - ay) ** 2), CIRCLE_MAX_R)
+                    growing_circle = (ax, ay, r, t["circle_colour"])
 
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
@@ -607,9 +720,9 @@ def main():
                 else:
                     circle = None
                     if t["start_x"] < 0.5:
-                        font_index += 1
-                    else:
                         font_index = max(0, font_index - 1)
+                    else:
+                        font_index += 1
                     scene, font_index = build_scene(
                         fonts, font_index, ui_font, inverted, screen, case_cache, circle
                     )
